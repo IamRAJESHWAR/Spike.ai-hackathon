@@ -1,4 +1,19 @@
-"""FastAPI application for AI Backend."""
+"""
+Spike AI Backend - FastAPI Application Entry Point
+
+This module provides the HTTP API interface for the multi-agent AI backend.
+It exposes endpoints for natural language queries and routes them through
+the orchestrator to appropriate specialized agents.
+
+Endpoints:
+    GET  /         - Root health check
+    GET  /health   - Health status endpoint
+    POST /query    - Main query endpoint (accepts natural language questions)
+    POST /query/stream - Streaming query endpoint with SSE progress updates
+
+Author: Spike AI Hackathon 2025
+License: MIT
+"""
 
 import sys
 import io

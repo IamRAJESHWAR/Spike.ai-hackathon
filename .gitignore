@@ -1,14 +1,50 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
-env/
+
+# Virtual Environments
+.venv/
 venv/
 ENV/
+env/
+
+# Sensitive Files
 credentials.json
 .env
+*.key
+*.pem
+
+# Runtime Files
 *.log
 *.pid
+server.log
+server.pid
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary
+*.tmp
+*.bak
+*.cache
