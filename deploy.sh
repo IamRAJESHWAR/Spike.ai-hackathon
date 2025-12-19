@@ -46,22 +46,14 @@ uv pip install -r requirements.txt
 
 # Check for credentials.json
 if [ ! -f "credentials.json" ]; then
-    echo "WARNING: credentials.json not found. Please ensure it exists at the repository root."
-    echo "Creating placeholder credentials.json..."
-    cat > credentials.json <<EOF
-{
-  "type": "service_account",
-  "project_id": "placeholder-project",
-  "private_key_id": "placeholder",
-  "private_key": "-----BEGIN PRIVATE KEY-----\nPLACEHOLDER\n-----END PRIVATE KEY-----\n",
-  "client_email": "placeholder@placeholder.iam.gserviceaccount.com",
-  "client_id": "placeholder",
-  "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-  "token_uri": "https://oauth2.googleapis.com/token",
-  "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-  "client_x509_cert_url": "placeholder"
-}
-EOF
+    echo ""
+    echo "ERROR: credentials.json not found!"
+    echo ""
+    echo "Please add your Google Cloud service account JSON file"
+    echo "as 'credentials.json' in the repository root, then run:"
+    echo "  bash deploy.sh"
+    echo ""
+    exit 1
 fi
 
 # Set environment variable
