@@ -301,12 +301,8 @@ The deployment script:
 - ✅ Saves PID to `server.pid`
 - ✅ Completes in <7 minutes
 
-## Contact
-
-**Built for:** Spike AI Builder Hackathon 2025  
-**Developer:** rajeshwar8616@gmail.com  
-**Repository:** [GitHub Link]
-
 ---
 
-**🚀 Ready for production deployment!**
+**Built for Spike AI Builder Hackathon 2025**
+
+🚀 **Ready for production deployment!**
