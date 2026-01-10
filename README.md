@@ -1,12 +1,51 @@
-# Spike AI Backend - Multi-Agent Analytics & SEO System
+# Spike AI Backend - LangGraph ReAct Multi-Agent Analytics & SEO System
 
 ## Overview
 
-A production-ready AI backend system that intelligently routes natural language queries to specialized agents for Google Analytics 4 (GA4) data analysis and technical SEO audits. Built with FastAPI, LiteLLM, and intelligent orchestration.
+A production-ready AI backend system built with **LangGraph** using the **ReAct (Thought-Action-Observation)** pattern. The system intelligently reasons about queries, takes actions by calling specialized agents for Google Analytics 4 (GA4) and SEO audits, observes results, and iterates until it has enough information to answer.
 
 ## Architecture Overview
 
-### System Architecture
+### ReAct (Thought-Action-Observation) Loop
+
+```
+                ┌──────────────────┐
+                │      START       │
+                └────────┬─────────┘
+                         │
+                ┌────────▼─────────┐
+        ┌──────►│      THINK       │  "What information do I need?"
+        │       │   (LLM Reasoning)│
+        │       └────────┬─────────┘
+        │                │
+        │       ┌────────▼─────────┐
+        │       │      ACTION      │  Execute: analytics_query,
+        │       │  (Call Tool)     │           seo_query, or
+        │       │                  │           final_answer
+        │       └────────┬─────────┘
+        │                │
+        │       ┌────────▼─────────┐
+        │       │     OBSERVE      │  "What did I learn?"
+        │       │ (Process Result) │
+        │       └────────┬─────────┘
+        │                │
+        │       ┌────────▼─────────┐
+        │  No   │    COMPLETE?     │  Have enough info?
+        └───────┤                  │  Max iterations reached?
+                └────────┬─────────┘
+                         │ Yes
+                ┌────────▼─────────┐
+                │   FINAL ANSWER   │  Synthesize response
+                └────────┬─────────┘
+                         │
+                ┌────────▼─────────┐
+                │       END        │
+                └──────────────────┘
+
+        Max Iterations: 5 (prevents infinite loops)
+```
+
+### System Components
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -26,23 +65,15 @@ A production-ready AI backend system that intelligently routes natural language 
                   │
                   ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    ORCHESTRATOR                                  │
+│               LANGGRAPH ORCHESTRATOR                             │
 │                  (orchestrator.py)                              │
 │  ┌──────────────────────────────────────────────────────────┐  │
-│  │  TIER 1: Intent Classification (LLM)                     │  │
-│  │  ├─ Analytics: traffic, users, sessions                  │  │
-│  │  ├─ SEO: technical issues, accessibility, status codes   │  │
-│  │  └─ Multi-Agent: combined analytics + SEO queries        │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  TIER 2: Agent Routing                                   │  │
-│  │  └─ Routes query to appropriate specialized agent(s)     │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │  TIER 3: Multi-Agent Orchestration                       │  │
-│  │  ├─ Query decomposition (LLM)                            │  │
-│  │  ├─ Parallel/sequential agent invocation                 │  │
-│  │  └─ Response aggregation (LLM)                           │  │
+│  │  StateGraph with Typed State (AgentState)                │  │
+│  │  ├─ classify_intent: LLM-based intent detection          │  │
+│  │  ├─ Conditional Routing: analytics/seo/multi_agent       │  │
+│  │  ├─ decompose_query: Split complex queries               │  │
+│  │  ├─ parallel_agents: Execute multiple agents             │  │
+│  │  └─ aggregate_results: Combine responses                 │  │
 │  └──────────────────────────────────────────────────────────┘  │
 └───────────┬─────────────────────────────┬───────────────────────┘
             │                             │

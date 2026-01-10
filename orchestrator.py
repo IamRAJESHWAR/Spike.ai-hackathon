@@ -1,435 +1,531 @@
-"""Orchestrator for intent detection and agent routing."""
+"""
+LangGraph-based Orchestrator with ReAct (Thought-Action-Observation) Loop.
+
+This module implements a ReAct pattern where the agent:
+1. THINKS about what action to take
+2. ACTS by calling the appropriate tool/agent
+3. OBSERVES the result and decides if complete
+4. LOOPS back to THINK if more actions needed
+
+Architecture:
+                    ┌──────────────────┐
+                    │      START       │
+                    └────────┬─────────┘
+                             │
+                    ┌────────▼─────────┐
+                    │      THINK       │◄─────────────────┐
+                    │  (Reason about   │                  │
+                    │   what to do)    │                  │
+                    └────────┬─────────┘                  │
+                             │                            │
+                    ┌────────▼─────────┐                  │
+                    │      ACTION      │                  │
+                    │  (Execute tool)  │                  │
+                    └────────┬─────────┘                  │
+                             │                            │
+                    ┌────────▼─────────┐                  │
+                    │     OBSERVE      │                  │
+                    │ (Process result) │                  │
+                    └────────┬─────────┘                  │
+                             │                            │
+                    ┌────────▼─────────┐      No          │
+                    │    COMPLETE?     ├──────────────────┘
+                    └────────┬─────────┘
+                             │ Yes
+                    ┌────────▼─────────┐
+                    │   FINAL ANSWER   │
+                    └────────┬─────────┘
+                             │
+                    ┌────────▼─────────┐
+                    │       END        │
+                    └──────────────────┘
+"""
 
 import json
-from typing import Dict, Any, Optional
-from llm_utils import llm_client
+from typing import Dict, Any, Optional, List, Annotated
+from operator import add
+
+from langgraph.graph import StateGraph, END
+
 from analytics_agent import AnalyticsAgent
 from seo_agent import SEOAgent
+from llm_utils import llm_client
 import config
 
 
-class Orchestrator:
-    """Central orchestrator for intent detection and agent routing."""
+class AgentState(Dict):
+    """
+    State schema for the ReAct LangGraph workflow.
+    
+    This state is passed between all nodes and tracks:
+    - Input query and context
+    - Thought-Action-Observation history
+    - Iteration tracking
+    - Final response
+    """
+    # Input fields
+    query: str
+    property_id: Optional[str]
+    
+    # ReAct loop state
+    thoughts: List[str]           # History of reasoning
+    actions: List[Dict[str, Any]] # History of actions taken
+    observations: List[str]       # History of observations
+    
+    # Current step
+    current_thought: Optional[str]
+    current_action: Optional[Dict[str, Any]]
+    current_observation: Optional[str]
+    
+    # Control flow
+    iteration: int
+    max_iterations: int
+    is_complete: bool
+    
+    # Final output
+    final_response: Optional[str]
+    error: Optional[str]
+
+
+# Available tools/actions the agent can take
+AVAILABLE_TOOLS = """
+Available Tools:
+1. analytics_query: Query Google Analytics 4 for traffic data, users, sessions, page views, etc.
+   - Use when: User asks about traffic, users, sessions, page views, sources, devices, trends
+   - Input: Natural language query about analytics
+
+2. seo_query: Query SEO audit data for technical issues, accessibility, status codes, etc.
+   - Use when: User asks about SEO issues, meta tags, titles, HTTPS, indexability, status codes
+   - Input: Natural language query about SEO
+
+3. final_answer: Provide the final answer to the user
+   - Use when: You have enough information to fully answer the user's question
+   - Input: The complete answer to return to the user
+"""
+
+
+class LangGraphOrchestrator:
+    """
+    LangGraph-based orchestrator with ReAct (Thought-Action-Observation) loop.
+    
+    The agent iteratively:
+    1. Thinks about what information is needed
+    2. Takes an action (calls a tool)
+    3. Observes the result
+    4. Decides if more actions are needed or if it can answer
+    """
+    
+    MAX_ITERATIONS = 5  # Prevent infinite loops
     
     def __init__(self):
-        """Initialize orchestrator with agents."""
+        """Initialize the orchestrator with agents and build the graph."""
         self.analytics_agent = AnalyticsAgent()
         self.seo_agent = SEOAgent()
         self.default_property_id = config.GA4_PROPERTY_ID
-        print(f"[OK] Orchestrator initialized (Default Property ID: {self.default_property_id})")
-    
-    def detect_intent(self, query: str, property_id: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Detect user intent and determine which agent(s) to use.
         
-        Args:
-            query: Natural language query
-            property_id: GA4 property ID (if provided, hints at analytics intent)
-            
-        Returns:
-            Dictionary with intent classification
+        # Build the LangGraph workflow with ReAct pattern
+        self.graph = self._build_react_graph()
+        self.app = self.graph.compile()
+        
+        print(f"[OK] LangGraph ReAct Orchestrator initialized (Default Property ID: {self.default_property_id})")
+    
+    def _build_react_graph(self) -> StateGraph:
         """
-        prompt = f"""You are an expert intent classifier for a multi-agent AI system that analyzes web analytics and SEO data.
-
-=== AVAILABLE AGENTS ===
-
-1. ANALYTICS AGENT (Google Analytics 4)
-   Handles queries about:
-   - Traffic metrics: page views, users, sessions, bounce rate, engagement
-   - Traffic sources: organic, paid, referral, social, direct, email
-   - User behavior: session duration, pages per session, conversion events
-   - Demographics: country, city, device category, browser
-   - Time-series analysis: daily/weekly/monthly trends, comparisons
-   - Specific page performance: views, users, engagement for individual URLs
-   
-   Keywords: views, visitors, users, traffic, sessions, clicks, conversions, analytics, engagement, 
-   source, medium, campaign, behavior, trends, increase, decrease, comparison
-
-2. SEO AGENT (Screaming Frog Technical Audit)
-   Handles queries about:
-   - URL structure: protocols (HTTP/HTTPS), URL length, parameters
-   - On-page elements: title tags, meta descriptions, headings (H1-H6)
-   - Technical health: indexability, crawlability, status codes (200, 301, 404, 500)
-   - Content analysis: word count, duplicate content, missing elements
-   - Site architecture: internal links, external links, redirects
-   
-   Keywords: title, meta, description, HTTPS, HTTP, indexable, crawl, status code, redirect, 
-   duplicate, missing, technical SEO, on-page, site structure, URL
-
-3. MULTI-AGENT (Combines Both)
-   Required when query needs BOTH traffic performance AND technical SEO data.
-   Common patterns:
-   - "Top pages by [traffic metric] + their [SEO element]"
-   - "High-traffic pages with [SEO issue]"
-   - "Correlate [analytics metric] with [SEO attribute]"
-   - Comparing performance of pages with different SEO characteristics
-
-=== CLASSIFICATION RULES ===
-
-1. If query asks about traffic, users, views, sessions, sources → ANALYTICS
-2. If query asks about titles, meta tags, HTTPS, indexability, technical issues, accessibility, violations → SEO
-3. If query needs to COMBINE traffic data WITH SEO attributes → MULTI_AGENT
-4. Analyze the CONTENT of the query, not just whether propertyId is provided
-5. Keywords like "accessibility", "violations", "WCAG", "status code" → SEO
-6. Keywords like "users", "sessions", "traffic", "views" → ANALYTICS
-
-=== EXAMPLES ===
-
-Query: "How many users visited my site last week?"
-Intent: analytics (pure traffic metric)
-
-Query: "Which pages don't use HTTPS?"
-Intent: seo (pure technical issue)
-
-Query: "What are the top 10 pages by views AND their title tags?"
-Intent: multi_agent (needs both traffic ranking AND SEO data)
-
-Query: "Show me pages with high traffic that have missing meta descriptions"
-Intent: multi_agent (combines traffic threshold with SEO issue)
-
-Query: "Give me a breakdown of sessions by traffic source"
-Intent: analytics (analytics-only query)
-
-Query: "How many pages are indexable?"
-Intent: seo (SEO audit question)
-
-Query: "Compare page views between /pricing and /features"
-Intent: analytics (comparing traffic metrics)
-
-Query: "Which top 20% pages by traffic have duplicate title tags?"
-Intent: multi_agent (needs traffic ranking + SEO audit)
-
-=== USER QUERY ===
-
-Query: "{query}"
-
-=== TASK ===
-
-Analyze the query and classify the intent based ONLY on the query content. Consider:
-1. What data sources are needed?
-2. Can this be answered with analytics data alone?
-3. Can this be answered with SEO data alone?
-4. Does it require joining/combining both data sources?
-
-Ignore whether a property ID is provided - focus on what the user is asking for.
-
-Provide your response as JSON:
-{{
-  "intent": "analytics|seo|multi_agent",
-  "confidence": 0.0-1.0,
-  "reasoning": "Detailed explanation of why you chose this classification"
-}}
-
-Respond ONLY with valid JSON, no other text."""
-
-        response = llm_client.chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
+        Build the LangGraph StateGraph with ReAct loop pattern.
+        
+        Returns:
+            Configured StateGraph with Think-Act-Observe cycle
+        """
+        workflow = StateGraph(AgentState)
+        
+        # Add nodes for ReAct cycle
+        workflow.add_node("think", self._think_node)
+        workflow.add_node("action", self._action_node)
+        workflow.add_node("observe", self._observe_node)
+        workflow.add_node("final_answer", self._final_answer_node)
+        
+        # Set entry point
+        workflow.set_entry_point("think")
+        
+        # Think -> Action (always)
+        workflow.add_edge("think", "action")
+        
+        # Action -> Observe (always)
+        workflow.add_edge("action", "observe")
+        
+        # Observe -> conditional routing (loop or finish)
+        workflow.add_conditional_edges(
+            "observe",
+            self._should_continue,
+            {
+                "continue": "think",        # Loop back for more reasoning
+                "finish": "final_answer"    # Got enough info, generate answer
+            }
         )
         
+        # Final answer -> END
+        workflow.add_edge("final_answer", END)
+        
+        return workflow
+    
+    def _think_node(self, state: AgentState) -> Dict[str, Any]:
+        """
+        THINK Node: Reason about what action to take next.
+        
+        The LLM analyzes:
+        - The original query
+        - Previous actions and observations
+        - What information is still needed
+        """
+        query = state.get("query", "")
+        iteration = state.get("iteration", 0)
+        thoughts = state.get("thoughts", [])
+        actions = state.get("actions", [])
+        observations = state.get("observations", [])
+        
+        # Build context from history
+        history = ""
+        for i, (t, a, o) in enumerate(zip(thoughts, actions, observations)):
+            history += f"\n--- Iteration {i+1} ---\n"
+            history += f"Thought: {t}\n"
+            history += f"Action: {a.get('tool')} - {a.get('input', '')[:100]}...\n"
+            history += f"Observation: {o[:200]}...\n"
+        
+        prompt = f"""You are an intelligent AI assistant that answers questions about web analytics and SEO.
+You have access to tools to gather information. Think step by step about what you need to do.
+
+{AVAILABLE_TOOLS}
+
+=== USER QUESTION ===
+{query}
+
+=== PREVIOUS ACTIONS AND OBSERVATIONS ===
+{history if history else "None yet - this is the first iteration."}
+
+=== CURRENT ITERATION ===
+Iteration {iteration + 1} of {self.MAX_ITERATIONS}
+
+=== YOUR TASK ===
+
+Think about:
+1. What is the user actually asking for?
+2. What information have I gathered so far?
+3. What information do I still need?
+4. Which tool should I use next, OR do I have enough to answer?
+
+If you have gathered enough information to fully answer the question, use the "final_answer" tool.
+If you need more information, choose the appropriate tool (analytics_query or seo_query).
+
+Respond in this JSON format:
+{{
+  "thought": "Your reasoning about what to do next",
+  "action": {{
+    "tool": "analytics_query|seo_query|final_answer",
+    "input": "The query/input for the tool OR the final answer text"
+  }}
+}}
+
+Respond with ONLY valid JSON."""
+
         try:
+            response = llm_client.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3
+            )
+            
+            # Parse JSON response
             json_start = response.find('{')
             json_end = response.rfind('}') + 1
             if json_start >= 0 and json_end > json_start:
                 response = response[json_start:json_end]
             
-            intent = json.loads(response)
-            return intent
-        
-        except json.JSONDecodeError as e:
-            print(f"Failed to parse intent: {e}")
-            # Default to analytics if property_id provided, else SEO
+            result = json.loads(response)
+            thought = result.get("thought", "")
+            action = result.get("action", {"tool": "final_answer", "input": "Unable to process"})
+            
+            print(f"\n{'='*60}")
+            print(f"🧠 THINK (Iteration {iteration + 1})")
+            print(f"{'='*60}")
+            print(f"💭 Thought: {thought}")
+            print(f"🎯 Planned Action: {action.get('tool')}")
+            
             return {
-                'intent': 'analytics' if property_id else 'seo',
-                'confidence': 0.5,
-                'reasoning': 'Failed to parse, using default'
+                "current_thought": thought,
+                "current_action": action,
+                "iteration": iteration + 1,
+                "thoughts": thoughts + [thought]
+            }
+            
+        except Exception as e:
+            print(f"❌ Error in think node: {e}")
+            return {
+                "current_thought": f"Error occurred: {str(e)}",
+                "current_action": {"tool": "final_answer", "input": f"I encountered an error: {str(e)}"},
+                "iteration": iteration + 1,
+                "thoughts": thoughts + [f"Error: {str(e)}"]
             }
     
-    def route_query(
-        self, 
-        query: str, 
-        property_id: Optional[str] = None
-    ) -> str:
+    def _action_node(self, state: AgentState) -> Dict[str, Any]:
         """
-        Route query to appropriate agent(s) and return response.
+        ACTION Node: Execute the chosen tool/action.
+        
+        Dispatches to:
+        - analytics_query: Call Analytics Agent
+        - seo_query: Call SEO Agent  
+        - final_answer: Prepare final response
+        """
+        action = state.get("current_action", {})
+        tool = action.get("tool", "final_answer")
+        tool_input = action.get("input", "")
+        property_id = state.get("property_id") or self.default_property_id
+        actions = state.get("actions", [])
+        
+        print(f"\n⚡ ACTION: {tool}")
+        print(f"   Input: {tool_input[:100]}...")
+        
+        observation = ""
+        
+        try:
+            if tool == "analytics_query":
+                print("   📊 Calling Analytics Agent...")
+                observation = self.analytics_agent.handle_query(tool_input, property_id)
+                
+            elif tool == "seo_query":
+                print("   🔍 Calling SEO Agent...")
+                observation = self.seo_agent.handle_query(tool_input)
+                
+            elif tool == "final_answer":
+                # For final_answer, the input IS the answer
+                observation = f"FINAL_ANSWER: {tool_input}"
+                
+            else:
+                observation = f"Unknown tool: {tool}. Available tools: analytics_query, seo_query, final_answer"
+                
+        except Exception as e:
+            observation = f"Error executing {tool}: {str(e)}"
+            print(f"   ❌ Error: {e}")
+        
+        return {
+            "current_observation": observation,
+            "actions": actions + [action]
+        }
+    
+    def _observe_node(self, state: AgentState) -> Dict[str, Any]:
+        """
+        OBSERVE Node: Process the result of the action.
+        
+        Records the observation and prepares for next iteration
+        or final answer.
+        """
+        observation = state.get("current_observation", "")
+        observations = state.get("observations", [])
+        current_action = state.get("current_action", {})
+        
+        print(f"\n👁️ OBSERVE")
+        print(f"   Result length: {len(observation)} chars")
+        print(f"   Preview: {observation[:200]}...")
+        
+        # Check if this was a final_answer action
+        is_complete = (
+            current_action.get("tool") == "final_answer" or 
+            observation.startswith("FINAL_ANSWER:")
+        )
+        
+        return {
+            "observations": observations + [observation],
+            "is_complete": is_complete
+        }
+    
+    def _should_continue(self, state: AgentState) -> str:
+        """
+        Conditional edge: Decide whether to continue loop or finish.
+        
+        Returns:
+            "continue" to loop back to think
+            "finish" to generate final answer
+        """
+        is_complete = state.get("is_complete", False)
+        iteration = state.get("iteration", 0)
+        max_iterations = state.get("max_iterations", self.MAX_ITERATIONS)
+        
+        if is_complete:
+            print(f"\n✅ Agent decided to finish with final answer")
+            return "finish"
+        
+        if iteration >= max_iterations:
+            print(f"\n⚠️ Max iterations ({max_iterations}) reached, forcing completion")
+            return "finish"
+        
+        print(f"\n🔄 Continuing to next iteration ({iteration + 1}/{max_iterations})")
+        return "continue"
+    
+    def _final_answer_node(self, state: AgentState) -> Dict[str, Any]:
+        """
+        FINAL ANSWER Node: Generate the final response.
+        
+        If the last action was final_answer, use that.
+        Otherwise, synthesize from all observations.
+        """
+        query = state.get("query", "")
+        observations = state.get("observations", [])
+        thoughts = state.get("thoughts", [])
+        current_observation = state.get("current_observation", "")
+        
+        print(f"\n{'='*60}")
+        print(f"📝 GENERATING FINAL ANSWER")
+        print(f"{'='*60}")
+        
+        # Check if last observation was already a final answer
+        if current_observation.startswith("FINAL_ANSWER:"):
+            final_response = current_observation.replace("FINAL_ANSWER:", "").strip()
+        else:
+            # Synthesize answer from all observations
+            all_observations = "\n\n".join([
+                f"Observation {i+1}:\n{obs}" 
+                for i, obs in enumerate(observations)
+                if not obs.startswith("FINAL_ANSWER:")
+            ])
+            
+            prompt = f"""Based on the following observations gathered to answer the user's question, 
+provide a comprehensive final answer.
+
+=== USER QUESTION ===
+{query}
+
+=== GATHERED INFORMATION ===
+{all_observations}
+
+=== YOUR TASK ===
+Synthesize all the information into a clear, comprehensive answer.
+Include specific numbers, insights, and recommendations where applicable.
+"""
+
+            try:
+                final_response = llm_client.chat_completion(
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
+                    max_tokens=3000
+                )
+            except Exception as e:
+                final_response = f"Error generating final answer: {str(e)}\n\nRaw observations:\n{all_observations}"
+        
+        iteration = state.get("iteration", 0)
+        print(f"\n✅ Answer generated after {iteration} iterations")
+        
+        return {
+            "final_response": final_response
+        }
+    
+    def route_query(self, query: str, property_id: Optional[str] = None) -> str:
+        """
+        Route a query through the ReAct LangGraph workflow.
+        
+        This is the main entry point, compatible with the original interface.
         
         Args:
             query: Natural language query
-            property_id: GA4 property ID (optional, uses default if not provided)
+            property_id: Optional GA4 property ID
             
         Returns:
             Response string
         """
-        try:
-            # Use default property ID if not provided
-            if not property_id:
-                property_id = self.default_property_id
-            
-            # Step 1: Detect intent
-            print(f"\n{'='*60}")
-            print(f"📨 Received Query: {query}")
-            print(f"🔑 Property ID: {property_id} {'(default)' if property_id == self.default_property_id else '(user-provided)'}")
-            
-            intent_result = self.detect_intent(query, property_id)
-            intent = intent_result.get('intent', 'analytics')
-            print(f"🎯 Intent: {intent} (confidence: {intent_result.get('confidence', 0):.2f})")
-            print(f"💭 Reasoning: {intent_result.get('reasoning', 'N/A')}")
-            
-            # Step 2: Route to agent(s) - LLM decides whether to use property_id
-            if intent == 'analytics':
-                print("→ Routing to Analytics Agent (LLM classified as analytics query)")
-                return self.analytics_agent.handle_query(query, property_id)
-            
-            elif intent == 'seo':
-                print("→ Routing to SEO Agent (LLM classified as SEO query, property_id available but not used)")
-                return self.seo_agent.handle_query(query)
-            
-            elif intent == 'multi_agent':
-                print("→ Routing to Multi-Agent System (LLM classified as multi-agent query)")
-                return self.handle_multi_agent_query(query, property_id)
-            
-            else:
-                return f"Unknown intent: {intent}. Please rephrase your query."
+        if not property_id:
+            property_id = self.default_property_id
         
+        # Create initial state
+        initial_state: AgentState = {
+            "query": query,
+            "property_id": property_id,
+            "thoughts": [],
+            "actions": [],
+            "observations": [],
+            "current_thought": None,
+            "current_action": None,
+            "current_observation": None,
+            "iteration": 0,
+            "max_iterations": self.MAX_ITERATIONS,
+            "is_complete": False,
+            "final_response": None,
+            "error": None
+        }
+        
+        print(f"\n{'='*60}")
+        print(f"🚀 Starting ReAct Loop")
+        print(f"{'='*60}")
+        print(f"📨 Query: {query}")
+        print(f"🔑 Property ID: {property_id}")
+        print(f"🔄 Max Iterations: {self.MAX_ITERATIONS}")
+        
+        try:
+            # Execute the graph
+            final_state = self.app.invoke(initial_state)
+            
+            iterations = final_state.get("iteration", 0)
+            print(f"\n{'='*60}")
+            print(f"✅ ReAct Loop Complete")
+            print(f"   Total Iterations: {iterations}")
+            print(f"   Actions Taken: {len(final_state.get('actions', []))}")
+            print(f"{'='*60}")
+            
+            return final_state.get("final_response", "No response generated.")
+            
         except Exception as e:
-            print(f"❌ Error in orchestrator: {e}")
+            print(f"❌ Error in ReAct workflow: {e}")
             return f"I encountered an error processing your request: {str(e)}"
     
-    def handle_multi_agent_query(
-        self, 
-        query: str, 
-        property_id: Optional[str] = None
-    ) -> str:
+    def get_graph_visualization(self) -> str:
         """
-        Handle queries that require multiple agents.
+        Get a text representation of the ReAct graph structure.
         
-        Args:
-            query: Natural language query
-            property_id: GA4 property ID (optional)
-            
         Returns:
-            Unified response
+            ASCII representation of the graph
         """
-        try:
-            # Decompose query into sub-queries
-            print("🔀 Decomposing multi-agent query...")
-            decomposition = self.decompose_query(query)
-            
-            # Execute sub-queries
-            analytics_result = None
-            seo_result = None
-            
-            if decomposition.get('analytics_query'):
-                if not property_id:
-                    analytics_result = "Analytics data not available (no propertyId provided)"
-                else:
-                    print(f"  📊 Analytics sub-query: {decomposition['analytics_query']}")
-                    analytics_result = self.analytics_agent.handle_query(
-                        decomposition['analytics_query'], 
-                        property_id
-                    )
-            
-            if decomposition.get('seo_query'):
-                print(f"  🔍 SEO sub-query: {decomposition['seo_query']}")
-                seo_result = self.seo_agent.handle_query(decomposition['seo_query'])
-            
-            # Aggregate results
-            print("🔗 Aggregating results...")
-            final_response = self.aggregate_results(
-                query, 
-                analytics_result, 
-                seo_result
-            )
-            
-            return final_response
-        
-        except Exception as e:
-            print(f"Error in multi-agent handling: {e}")
-            return f"I encountered an error processing your multi-domain query: {str(e)}"
-    
-    def decompose_query(self, query: str) -> Dict[str, str]:
-        """
-        Decompose a multi-agent query into sub-queries for each agent.
-        
-        Args:
-            query: Original query
-            
-        Returns:
-            Dictionary with analytics_query and seo_query
-        """
-        prompt = f"""You are an expert query decomposer for a multi-agent AI system. Your task is to break down complex questions that require both analytics AND SEO data into separate, focused sub-queries.
+        return """
+ReAct LangGraph Workflow:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-=== AVAILABLE DATA SOURCES ===
+                ┌──────────────────┐
+                │      START       │
+                └────────┬─────────┘
+                         │
+                ┌────────▼─────────┐
+        ┌──────►│      THINK       │
+        │       │  "What do I need │
+        │       │   to do next?"   │
+        │       └────────┬─────────┘
+        │                │
+        │       ┌────────▼─────────┐
+        │       │      ACTION      │
+        │       │  Execute tool:   │
+        │       │  • analytics     │
+        │       │  • seo           │
+        │       │  • final_answer  │
+        │       └────────┬─────────┘
+        │                │
+        │       ┌────────▼─────────┐
+        │       │     OBSERVE      │
+        │       │  Process result  │
+        │       └────────┬─────────┘
+        │                │
+        │       ┌────────▼─────────┐
+        │  No   │    COMPLETE?     │
+        └───────┤  Have enough     │
+                │  information?    │
+                └────────┬─────────┘
+                         │ Yes
+                ┌────────▼─────────┐
+                │   FINAL ANSWER   │
+                │  Synthesize and  │
+                │  respond         │
+                └────────┬─────────┘
+                         │
+                ┌────────▼─────────┐
+                │       END        │
+                └──────────────────┘
 
-1. ANALYTICS AGENT (Google Analytics 4)
-   Can answer: traffic metrics, user counts, page views, sessions, sources, trends, comparisons
-   Cannot answer: technical SEO attributes, page content, meta tags
+Max Iterations: 5 (prevents infinite loops)
+"""
 
-2. SEO AGENT (Screaming Frog Technical Audit)
-   Can answer: title tags, meta descriptions, HTTPS status, indexability, technical issues, URL structure
-   Cannot answer: traffic data, user behavior, conversion metrics
 
-=== DECOMPOSITION RULES ===
-
-1. ANALYTICS SUB-QUERY:
-   - Should ask for traffic/performance metrics
-   - Include time periods if mentioned
-   - Request top N items if ranking is needed
-   - Focus on quantitative performance
-   - Example: "What are the top 10 pages by page views in the last 30 days?"
-
-2. SEO SUB-QUERY:
-   - Should ask for technical SEO attributes
-   - Reference the same pages/URLs mentioned in analytics query
-   - Focus on on-page elements and technical health
-   - Example: "What are the title tags and meta descriptions for these top pages?"
-
-3. BOTH QUERIES SHOULD:
-   - Be self-contained (can be executed independently)
-   - Reference the same pages/URLs for proper joining
-   - Be clear and specific
-   - Maintain the user's intent and filters
-
-=== EXAMPLES ===
-
-Query: "What are the top 10 pages by views in the last 14 days, and what are their title tags?"
-Output:
-{{
-  "analytics_query": "What are the top 10 pages by page views in the last 14 days? Include the page URLs.",
-  "seo_query": "What are the title tags for all pages in the site? Include the page URLs."
-}}
-
-Query: "Show me high-traffic pages with missing meta descriptions"
-Output:
-{{
-  "analytics_query": "What are the top 20 pages by page views in the last 30 days? Include page URLs.",
-  "seo_query": "Which pages have missing or empty meta descriptions? Include the page URLs."
-}}
-
-Query: "Which pages are in the top 20% by views but have duplicate title tags?"
-Output:
-{{
-  "analytics_query": "What are the top 20% of pages by page views? Include page URLs and view counts.",
-  "seo_query": "Which pages have duplicate title tags? Include page URLs and the title tag content."
-}}
-
-Query: "Compare traffic between HTTPS and HTTP pages"
-Output:
-{{
-  "analytics_query": "What is the total traffic (page views and users) for all pages? Include page URLs.",
-  "seo_query": "Which pages use HTTP vs HTTPS? Include page URLs and protocol."
-}}
-
-Query: "Top 5 pages by traffic and their indexability status"
-Output:
-{{
-  "analytics_query": "What are the top 5 pages by page views in the last 30 days? Include page URLs.",
-  "seo_query": "What is the indexability status for all pages? Include page URLs and indexability."
-}}
-
-=== USER QUERY ===
-
-{query}
-
-=== YOUR TASK ===
-
-Decompose this query into two focused sub-queries. Think through:
-1. What traffic/performance data is needed? (Analytics query)
-2. What technical SEO data is needed? (SEO query)
-3. How will the results be joined? (both should reference page URLs)
-4. Are there time periods, filters, or rankings mentioned?
-
-Provide your response as JSON:
-{{
-  "analytics_query": "Focused query for GA4 analytics data (traffic, users, views, etc.)",
-  "seo_query": "Focused query for SEO technical audit data (titles, meta, HTTPS, indexability, etc.)"
-}}
-
-Respond with ONLY the JSON, no explanatory text."""
-
-        response = llm_client.chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
-        )
-        
-        try:
-            json_start = response.find('{')
-            json_end = response.rfind('}') + 1
-            if json_start >= 0 and json_end > json_start:
-                response = response[json_start:json_end]
-            
-            return json.loads(response)
-        except:
-            return {
-                'analytics_query': query,
-                'seo_query': query
-            }
-    
-    def aggregate_results(
-        self, 
-        original_query: str,
-        analytics_result: Optional[str] = None,
-        seo_result: Optional[str] = None
-    ) -> str:
-        """
-        Aggregate results from multiple agents into a unified response.
-        
-        Args:
-            original_query: Original user query
-            analytics_result: Response from analytics agent
-            seo_result: Response from SEO agent
-            
-        Returns:
-            Unified natural language response
-        """
-        prompt = f"""You are an expert data analyst specializing in cross-domain insights. Synthesize analytics and SEO data into a unified, actionable answer.
-
-=== USER'S ORIGINAL QUESTION ===
-{original_query}
-
-=== ANALYTICS DATA (Google Analytics 4) ===
-{analytics_result if analytics_result else 'Analytics data not available'}
-
-=== SEO AUDIT DATA (Screaming Frog) ===
-{seo_result if seo_result else 'SEO data not available'}
-
-=== YOUR TASK ===
-
-Combine these two data sources into a comprehensive answer with this structure:
-
-1. EXECUTIVE SUMMARY (2-3 sentences)
-   - Direct answer combining both sources
-   - Example: "Your top 5 pages generated 45,234 views last month. Of these, 3 have optimized title tags under 60 characters, while 2 exceed the limit."
-
-2. DETAILED FINDINGS (by page or category)
-   - Match analytics performance with SEO attributes
-   - Use clear formatting (numbered list or table-like)
-   - Example: "1. Homepage (/): 12,445 views, Title: 'Welcome' (23 chars, \u2713 Optimized)"
-
-3. CROSS-DOMAIN INSIGHTS (2-3 points)
-   - Correlations between traffic and SEO health
-   - Opportunities or risks
-   - Example: "Your highest-traffic page has a title 12% too long, potentially reducing CTR."
-
-4. RECOMMENDATIONS (2-4 actions, prioritized)
-   - Specific, actionable steps
-   - Prioritize by impact (high-traffic + SEO issues = top priority)
-   - Example: "Priority 1: Shorten /pricing title from 67 to 58 characters."
-
-=== STYLE ===
-- Use SPECIFIC NUMBERS from both sources
-- Connect traffic metrics with SEO attributes
-- Use \u2713 \u26a0 \u2717 for visual clarity
-- Highlight high-traffic pages with SEO issues (biggest opportunities)
-- Be conversational but data-driven
-- Calculate percentages when adding value
-
-If user requested JSON format, provide structured JSON. Otherwise, use natural language."""
-
-        response = llm_client.chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=3000
-        )
-        
-        return response
+# Create an alias for backward compatibility
+Orchestrator = LangGraphOrchestrator

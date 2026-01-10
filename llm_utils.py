@@ -2,7 +2,7 @@
 
 import time
 from typing import Any, Dict, List
-from openai import OpenAI, APIError
+from openai import OpenAI, APIError, APITimeoutError, APIConnectionError
 import config
 
 
@@ -12,7 +12,8 @@ class LLMClient:
     def __init__(self):
         self.client = OpenAI(
             api_key=config.LITELLM_API_KEY,
-            base_url=config.LITELLM_BASE_URL
+            base_url=config.LITELLM_BASE_URL,
+            timeout=120.0  # Increase timeout to 120 seconds
         )
     
     def chat_completion(
@@ -44,20 +45,31 @@ class LLMClient:
                 )
                 return response.choices[0].message.content
             
+            except APITimeoutError as e:
+                wait_time = config.BASE_DELAY * (2 ** attempt)
+                print(f"Request timeout. Retrying in {wait_time}s (attempt {attempt + 1}/{config.MAX_RETRIES})...")
+                time.sleep(wait_time)
+            
+            except APIConnectionError as e:
+                wait_time = config.BASE_DELAY * (2 ** attempt)
+                print(f"Connection error. Retrying in {wait_time}s (attempt {attempt + 1}/{config.MAX_RETRIES})...")
+                time.sleep(wait_time)
+            
             except APIError as e:
-                if e.status_code == 429:
+                if hasattr(e, 'status_code') and e.status_code == 429:
                     wait_time = config.BASE_DELAY * (2 ** attempt)
                     print(f"Rate limited (429). Retrying in {wait_time}s (attempt {attempt + 1}/{config.MAX_RETRIES})...")
                     time.sleep(wait_time)
                 else:
-                    print(f"API Error (Status: {e.status_code}): {e}")
+                    status = getattr(e, 'status_code', 'unknown')
+                    print(f"API Error (Status: {status}): {e}")
                     raise
             
             except Exception as e:
                 print(f"Unexpected error in LLM call: {e}")
                 raise
         
-        raise Exception("Failed to make API call after multiple retries due to rate limiting")
+        raise Exception("Failed to make API call after multiple retries")
 
 
 # Global LLM client instance

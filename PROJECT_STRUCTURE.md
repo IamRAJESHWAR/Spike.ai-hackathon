@@ -12,7 +12,7 @@ spike-ai-backend/
 │
 ├── config.py                  # Central configuration (API keys, endpoints)
 ├── main.py                    # FastAPI application entry point
-├── orchestrator.py            # Intent classification and agent routing
+├── orchestrator.py            # LangGraph-based intent classification and agent routing
 ├── analytics_agent.py         # Google Analytics 4 (GA4) agent
 ├── seo_agent.py               # SEO audit agent (Screaming Frog data)
 ├── llm_utils.py               # LiteLLM client and utilities
@@ -32,7 +32,7 @@ spike-ai-backend/
 
 ### Core Application
 - **main.py**: FastAPI server, HTTP endpoints, request/response handling
-- **orchestrator.py**: Intent detection, agent selection, multi-agent coordination
+- **orchestrator.py**: LangGraph ReAct workflow with Thought-Action-Observation loop, iterative reasoning until answer is found
 - **config.py**: Environment configuration, API keys, constants
 
 ### Agents
@@ -66,26 +66,33 @@ spike-ai-backend/
 
 ## Key Design Principles
 
-### 1. Separation of Concerns
+### 1. LangGraph State Management
+The system uses LangGraph's StateGraph for workflow orchestration:
+- **Nodes**: Individual processing steps (classify_intent, analytics_node, seo_node, etc.)
+- **Edges**: Transitions between nodes
+- **Conditional Edges**: Dynamic routing based on intent classification
+- **State**: Typed dictionary passed through all nodes
+
+### 2. Separation of Concerns
 Each module has a single, well-defined responsibility.
 
-### 2. Dependency Injection
+### 3. Dependency Injection
 Agents are initialized once and reused (singleton pattern in orchestrator).
 
-### 3. Error Handling
-Every agent gracefully handles:
+### 4. Error Handling
+Every agent and graph node gracefully handles:
 - Empty datasets
 - API failures
 - Invalid queries
 - Rate limiting
 
-### 4. Extensibility
+### 5. Extensibility
 Adding new agents requires:
 1. Create new agent file (e.g., `content_agent.py`)
-2. Add to orchestrator's intent classification
-3. Add routing logic
+2. Add new node to the LangGraph workflow
+3. Add routing logic in conditional edges
 
-### 5. Configuration Management
+### 6. Configuration Management
 All environment-specific values in `config.py`:
 - No hardcoded API keys in code
 - Easy to override with environment variables
@@ -93,9 +100,16 @@ All environment-specific values in `config.py`:
 
 ## Data Flow
 
-### Single-Agent Query
+### Single-Agent Query (LangGraph)
 ```
-Client → FastAPI → Orchestrator → Agent → Data Source → Agent → Orchestrator → FastAPI → Client
+Client → FastAPI → Orchestrator.route_query() 
+       → LangGraph.invoke(initial_state)
+       → classify_intent node
+       → route_by_intent (conditional)
+       → analytics_node OR seo_node
+       → format_output node
+       → END
+       → return final_response
 ```
 
 ### Multi-Agent Query

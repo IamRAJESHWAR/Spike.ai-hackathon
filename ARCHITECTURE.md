@@ -2,7 +2,59 @@
 
 ## System Design
 
-The Spike AI Backend implements a multi-tier architecture with intelligent routing, specialized agents, and robust error handling.
+The Spike AI Backend implements a **LangGraph-based multi-agent architecture** using the **ReAct (Thought-Action-Observation)** pattern. The system iteratively reasons about queries, takes actions by calling specialized agents, observes results, and continues until it has enough information to answer comprehensively.
+
+## ReAct (Thought-Action-Observation) Loop
+
+The core of the system is a ReAct loop that allows the AI to:
+1. **Think** - Reason about what information is needed
+2. **Act** - Call the appropriate tool (analytics, SEO, or final answer)
+3. **Observe** - Process the results and decide what to do next
+4. **Repeat** - Loop back to Think if more information is needed
+
+```
+                ┌──────────────────┐
+                │      START       │
+                └────────┬─────────┘
+                         │
+                ┌────────▼─────────┐
+        ┌──────►│      THINK       │  "What information do I need?"
+        │       │   (LLM Reasoning)│  Plan next action based on context
+        │       └────────┬─────────┘
+        │                │
+        │       ┌────────▼─────────┐
+        │       │      ACTION      │  Execute one of:
+        │       │   (Call Tool)    │  • analytics_query - GA4 data
+        │       │                  │  • seo_query - SEO audit data
+        │       │                  │  • final_answer - Synthesize response
+        │       └────────┬─────────┘
+        │                │
+        │       ┌────────▼─────────┐
+        │       │     OBSERVE      │  "What did I learn?"
+        │       │ (Process Result) │  Store observation for context
+        │       └────────┬─────────┘
+        │                │
+        │       ┌────────▼─────────┐
+        │  No   │    COMPLETE?     │  • final_answer called?
+        └───────┤                  │  • Max iterations (5) reached?
+                └────────┬─────────┘
+                         │ Yes
+                ┌────────▼─────────┐
+                │   FINAL ANSWER   │  Synthesize comprehensive response
+                └────────┬─────────┘  from all observations
+                         │
+                ┌────────▼─────────┐
+                │       END        │
+                └──────────────────┘
+```
+
+### Key Features
+
+- **Iterative Reasoning**: The system doesn't just make one pass - it can gather information from multiple sources
+- **Intelligent Tool Selection**: LLM decides which tool to call based on the query and current context
+- **Context Accumulation**: Each observation is added to the context for subsequent reasoning
+- **Safety Limits**: Maximum 5 iterations prevents infinite loops
+- **Graceful Completion**: System synthesizes all gathered information into a coherent final answer
 
 ## Core Components
 
@@ -36,14 +88,102 @@ GET /health
 - Logging: INFO level to stdout
 - Timeout: 120 seconds for complex queries
 
-### 2. Orchestrator Layer (orchestrator.py)
+### 2. LangGraph ReAct Orchestrator (orchestrator.py)
 
-The orchestrator is the brain of the system, implementing a three-tier routing strategy:
+The orchestrator implements the **ReAct pattern** using LangGraph's StateGraph.
 
-#### Tier 1: Intent Classification
+#### State Schema (AgentState)
 
-**Method:** LLM-based analysis  
-**Model:** gemini-2.5-flash via LiteLLM
+```python
+class AgentState(TypedDict):
+    # Input fields
+    query: str
+    property_id: Optional[str]
+    
+    # ReAct loop state
+    thoughts: List[str]        # Reasoning history
+    actions: List[str]         # Actions taken (tool calls)
+    observations: List[str]    # Results from tool calls
+    
+    # Loop control
+    iteration: int             # Current iteration (max 5)
+    is_complete: bool          # Whether to exit the loop
+    
+    # Final output
+    final_response: Optional[str]
+    error: Optional[str]
+```
+
+#### Available Tools
+
+The LLM can choose from these tools during the ACTION phase:
+
+1. **analytics_query** - Query Google Analytics 4 for traffic, metrics, user behavior
+2. **seo_query** - Query SEO audit data for technical issues, page analysis
+3. **final_answer** - Synthesize all observations into a comprehensive response
+
+#### ReAct Prompt Strategy
+
+```
+You are an AI assistant with access to tools. Your goal is to answer the user's question.
+
+Current iteration: {iteration}/5
+
+**Observations so far:**
+{observations}
+
+**User's question:** {query}
+
+Think step by step:
+1. What information do I already have?
+2. What additional information do I need?
+3. Which tool should I call next?
+
+Respond with a JSON action:
+- {"tool": "analytics_query", "input": "your specific analytics question"}
+- {"tool": "seo_query", "input": "your specific SEO question"}  
+- {"tool": "final_answer", "input": "your comprehensive answer"}
+```
+    analytics_response: Optional[str]
+    seo_response: Optional[str]
+    
+    # Final output
+    final_response: Optional[str]
+    
+    # Metadata
+    error: Optional[str]
+    steps_completed: List[str]
+```
+
+#### Graph Nodes
+
+| Node | Purpose |
+|------|---------|
+| `classify_intent` | LLM-based intent classification |
+| `analytics_node` | Execute GA4 queries |
+| `seo_node` | Execute SEO data queries |
+| `decompose_query` | Split multi-agent queries |
+| `parallel_agents` | Execute both agents |
+| `aggregate_results` | Combine multi-agent responses |
+| `format_output` | Format final response |
+| `error_node` | Handle errors gracefully |
+
+#### Conditional Routing
+
+```python
+workflow.add_conditional_edges(
+    "classify_intent",
+    self._route_by_intent,
+    {
+        "analytics": "analytics_node",
+        "seo": "seo_node",
+        "multi_agent": "decompose_query",
+        "error": "error_node"
+    }
+)
+```
+
+#### Intent Classification Rules
 
 ```python
 Classification Rules:
@@ -55,76 +195,6 @@ Classification Rules:
 
 3. Multi-Agent: Queries requiring both analytics AND SEO data
    Keywords: AND, analyze both, combined, overall performance
-```
-
-**Key Feature:** Content-based routing (not property ID presence)
-
-The orchestrator analyzes the **semantic meaning** of the query, not just whether a property ID is provided. This ensures:
-
-- SEO queries route to SEO agent even with property ID present
-- Analytics queries require property ID but route based on content
-- Multi-agent queries are identified by complex requirements
-
-#### Tier 2: Single-Agent Routing
-
-**Analytics Agent:**
-
-```python
-Input: Query + Property ID
-Process:
-  1. Parse query parameters (metrics, dimensions, date range, filters)
-  2. Construct GA4 API request
-  3. Execute API call
-  4. Generate natural language response
-Output: Formatted response with data insights
-```
-
-**SEO Agent:**
-
-```python
-Input: Query (no property ID needed)
-Process:
-  1. Parse query to identify target issues
-  2. Fetch data from Google Sheets (Screaming Frog export)
-  3. Filter/analyze based on query requirements
-  4. Generate detailed response with recommendations
-Output: Technical analysis with actionable items
-```
-
-#### Tier 3: Multi-Agent Orchestration
-
-**Process:**
-
-```python
-1. Query Decomposition (LLM):
-   - Break complex query into sub-queries
-   - Identify dependencies between sub-queries
-
-2. Agent Invocation:
-   - Parallel execution when independent
-   - Sequential execution when dependent
-
-3. Response Aggregation (LLM):
-   - Combine agent responses
-   - Synthesize unified answer
-   - Maintain context and coherence
-```
-
-**Example Multi-Agent Flow:**
-
-```
-Query: "Analyze my website traffic AND technical SEO issues"
-
-Decomposition:
-  Sub-query 1: "What are the traffic patterns?" → Analytics Agent
-  Sub-query 2: "What are the technical SEO issues?" → SEO Agent
-
-Execution:
-  [Parallel] Analytics Agent → GA4 data
-  [Parallel] SEO Agent → Sheets data
-
-Aggregation:
-  LLM synthesizes both responses into unified analysis
 ```
 
 ### 3. Agent Layer
